@@ -1,0 +1,12 @@
+node_modules/
+.env
+*.log
+*.pid
+*.bak
+*.bak.*
+.venice-web-session.json
+venice-login.json
+venice-2fa-first-step.json
+.proxy-env
+session.json
+config.env

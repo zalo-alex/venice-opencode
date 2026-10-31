@@ -1,0 +1,26 @@
+{
+  "name": "venice-opencode",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy for the Venice web app, with tool calling for opencode",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "venice-opencode": "bin/venice-opencode.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "setup": "node bin/venice-opencode.mjs setup"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zalo-alex/venice-opencode.git"
+  },
+  "homepage": "https://github.com/zalo-alex/venice-opencode",
+  "dependencies": {
+    "wreq-js": "^2.3.0"
+  }
+}
