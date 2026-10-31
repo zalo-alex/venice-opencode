@@ -4,7 +4,8 @@ import fs from "node:fs";
 import { VeniceWebClient, decodeJwtPayload } from "./client.mjs";
 
 const PORT = Number(process.env.PORT || 3456);
-const HOST = process.env.HOST || "127.0.0.1";
+// HOST is a comma-separated list of addresses to listen on (0.0.0.0 / :: = every interface).
+const HOSTS = [...new Set((process.env.HOST || "127.0.0.1").split(",").map(h => h.trim()).filter(Boolean))];
 const AGENT_MODEL = process.env.AGENT_MODEL || "deepseek-v4-1-flash-free";
 const TOOLS_MODE = process.env.TOOLS_MODE || "client";
 const TOOLS_SHAPE = process.env.TOOLS_SHAPE || "mcp";
@@ -36,7 +37,7 @@ async function statusInfo() {
   } catch (e) { session.error = String(e.message || e); }
   return { version: VERSION, uptime: fmtUptime(Date.now() - startedAt),
     model: AGENT_MODEL, mode: TOOLS_MODE, shape: TOOLS_SHAPE, allModels: ALL_MODELS,
-    session, stats, recent: recent.map(r => ({ ...r, ago: fmtUptime(Date.now() - r.t) })) };
+    listen: HOSTS.map(h => `${h}:${PORT}`), session, stats, recent: recent.map(r => ({ ...r, ago: fmtUptime(Date.now() - r.t) })) };
 }
 
 const usable = (t) => {
@@ -392,7 +393,7 @@ let nativeScore = 0, turnCount = 0;
 
 const IDLE_MS = Number(process.env.IDLE_MS || 90_000);
 
-const server = http.createServer(async (req, res) => {
+const handler = async (req, res) => {
   let clientGone = false;
   res.on("close", () => { clientGone = true; });
   try {
@@ -607,21 +608,28 @@ const server = http.createServer(async (req, res) => {
     }
     send(res, 500, { error: { message: String(e) } });
   }
+};
+const servers = HOSTS.map((host) => {
+  const server = http.createServer(handler);
+  // Agent turns are separated by tool runs and approvals that easily outlast Node's 5s default
+  // keep-alive; a client reusing the socket at that moment gets a reset ("fetch failed").
+  server.keepAliveTimeout = 10 * 60_000;
+  server.headersTimeout = 10 * 60_000 + 5_000;
+  server.on("error", (e) => {
+    log("fatal", e.code === "EADDRINUSE" ? `${host}:${PORT} is already in use`
+      : e.code === "EADDRNOTAVAIL" ? `${host} is not an address of this machine` : `${host}: ${e}`);
+    process.exit(1);
+  });
+  server.listen(PORT, host, () => log("start", `listening on http://${host.includes(":") ? `[${host}]` : host}:${PORT}/v1 (agent ${AGENT_MODEL}, mode ${TOOLS_MODE}/${TOOLS_SHAPE})`));
+  return server;
 });
-// Agent turns are separated by tool runs and approvals that easily outlast Node's 5s default
-// keep-alive; a client reusing the socket at that moment gets a reset ("fetch failed").
-server.keepAliveTimeout = 10 * 60_000;
-server.headersTimeout = 10 * 60_000 + 5_000;
-server.on("error", (e) => {
-  log("fatal", e.code === "EADDRINUSE" ? `port ${PORT} is already in use` : String(e));
-  process.exit(1);
-});
-server.listen(PORT, HOST, () => log("start", `listening on http://${HOST}:${PORT}/v1 (agent ${AGENT_MODEL}, mode ${TOOLS_MODE}/${TOOLS_SHAPE})`));
+if (HOSTS.some(h => !/^(127\.|localhost$|::1$)/.test(h)))
+  log("warn", "listening beyond loopback: anyone who can reach this port can use your Venice session");
 
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     log("stop", `${sig} received, shutting down`);
-    server.close();
+    for (const server of servers) server.close();
     client.close().catch(() => {}).finally(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
   });

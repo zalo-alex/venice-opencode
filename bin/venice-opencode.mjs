@@ -18,6 +18,7 @@ ${c.bold("Usage")}  venice-opencode <command> [options]
 ${c.bold("Commands")}
   setup        Install / repair everything (login, opencode config, systemd service)
   login        Sign in to Venice again (email + password, or paste cookies)
+  listen [ADDR,...]   Change the interfaces the proxy listens on (--all, --local)
   status       Show service, session and model status
   start | stop | restart   Control the background service
   logs [-f]    Show service logs (-f to follow)
@@ -27,6 +28,7 @@ ${c.bold("Commands")}
 
 ${c.bold("Setup options")}
   --port N          Proxy port (default 3456)
+  --host A[,B,...]  Addresses to listen on (default 127.0.0.1; 0.0.0.0 = all)
   --model ID        Force the Venice agent model (skips detection)
   --json-mode       Force the JSON tool-call fallback
   --all-models      Advertise every free Venice model
@@ -50,6 +52,9 @@ function parseArgs(argv) {
     else if (a === "--no-service") o.noService = true;
     else if (a === "--reconfigure") o.reconfigure = true;
     else if (a === "--port") o.port = argv[++i];
+    else if (a === "--host") o.host = argv[++i];
+    else if (a === "--all") o.all = true;
+    else if (a === "--local") o.local = true;
     else if (a === "--model") o.model = argv[++i];
     else if (a === "--cookies") o.cookies = argv[++i];
     else if (a === "-f" || a === "--follow") o.follow = true;
@@ -60,6 +65,19 @@ function parseArgs(argv) {
 }
 
 const interactive = (o) => !o.yes && process.stdin.isTTY;
+
+const allPortsFree = async (cfg) => {
+  for (const h of core.hostList(cfg)) if (!(await portFree(h, Number(cfg.PORT)))) return false;
+  return true;
+};
+
+function checkHosts(value) {
+  const list = [...new Set(String(value).split(",").map((h) => h.trim()).filter(Boolean))];
+  if (!list.length) throw new Error("no address given");
+  const bad = list.find((h) => !core.validHost(h));
+  if (bad) throw new Error(`"${bad}" is not an IP address (use e.g. 127.0.0.1, 192.168.1.20, 0.0.0.0)`);
+  return list;
+}
 
 function portFree(host, port) {
   return new Promise((resolve) => {
@@ -197,6 +215,7 @@ async function cmdSetup(o) {
   // 2. Tool protocol
   ui.step(2, T, "Tool calling");
   if (o.port) cfg.PORT = String(o.port);
+  if (o.host) cfg.HOST = checkHosts(o.host).join(",");
   if (o.allModels) cfg.ALL_MODELS = "1";
   if (o.model) {
     cfg.AGENT_MODEL = o.model;
@@ -255,7 +274,7 @@ async function cmdSetup(o) {
   } else {
     if (stopLegacyProxy(cfg.PORT)) ui.info("Stopped the old standalone proxy");
     const running = core.serviceState() === "active";
-    if (!running && !(await portFree(cfg.HOST, Number(cfg.PORT)))) {
+    if (!running && !(await allPortsFree(cfg))) {
       throw new Error(`Port ${cfg.PORT} is already in use. Re-run with --port <other>.`);
     }
     await ui.spin("Installing systemd user service", async () => {
@@ -324,6 +343,66 @@ async function cmdSetup(o) {
 
 // ---------- other commands ----------
 
+async function cmdListen(o) {
+  const cfg = core.readConfig();
+  ui.banner("Listen addresses");
+  ui.table([["current", core.hostList(cfg).join(", ") + c.dim(`  port ${cfg.PORT}`)]]);
+  ui.out();
+
+  let hosts;
+  if (o.all) hosts = ["0.0.0.0"];
+  else if (o.local) hosts = ["127.0.0.1"];
+  else if (o._[1]) hosts = checkHosts(o._.slice(1).join(","));
+  else if (!interactive(o)) return;
+  else {
+    const choice = await ui.choose("Where should the proxy listen?", [
+      "This machine only " + c.dim("(127.0.0.1, safest)"),
+      "Every network interface " + c.dim("(0.0.0.0)"),
+      "Pick specific addresses",
+    ]);
+    if (choice === 0) hosts = ["127.0.0.1"];
+    else if (choice === 1) hosts = ["0.0.0.0"];
+    else {
+      const ifaces = core.listInterfaces();
+      ui.out();
+      ifaces.forEach((i, n) => ui.out(`    ${c.bold(String(n + 1).padStart(2))}) ${i.address.padEnd(40)} ${c.dim(i.name + (i.internal ? " (loopback)" : ""))}`));
+      const picked = await ui.prompt("Numbers or addresses, comma-separated:");
+      hosts = checkHosts(picked.split(",").map((t) => {
+        const n = Number(t.trim());
+        return Number.isInteger(n) && ifaces[n - 1] ? ifaces[n - 1].address : t.trim();
+      }).join(","));
+    }
+  }
+
+  const exposed = hosts.filter((h) => !core.isLoopback(h));
+  if (exposed.length) {
+    ui.out();
+    ui.warn("The proxy has NO authentication. Anyone who can reach " + exposed.join(", ") + " can spend your Venice session.");
+    ui.hint("Only do this on a trusted network or behind a firewall / VPN.");
+    if (interactive(o) && !(await ui.confirm("Listen on these addresses anyway?", false))) {
+      ui.info("Nothing changed");
+      return;
+    }
+  }
+
+  const before = core.baseUrl(cfg);
+  cfg.HOST = hosts.join(",");
+  if (!(core.serviceState() === "active") && !(await allPortsFree(cfg))) throw new Error(`Port ${cfg.PORT} is already in use on one of these addresses.`);
+  core.writeConfig(cfg);
+  ui.ok(`Listening on ${c.bold(cfg.HOST)} ${c.dim(`port ${cfg.PORT}`)}`);
+  if (core.baseUrl(cfg) !== before && core.updateOpencodeBaseUrl(cfg)) ui.ok(`Pointed opencode at ${core.baseUrl(cfg)}/v1`);
+  if (core.hasSystemd() && core.serviceState() === "active") {
+    await ui.spin("Restarting service", async () => {
+      const r = core.sysctl("restart", core.SERVICE);
+      if (r.status !== 0) throw new Error(r.stderr.trim());
+      if (!(await core.waitForProxy(cfg))) throw new Error("proxy did not come back - see: venice-opencode logs");
+      return "";
+    });
+  } else ui.hint("Applies the next time the service starts.");
+  ui.out();
+}
+
+
 async function cmdStatus() {
   const cfg = core.readConfig();
   ui.banner("Status", `v${core.VERSION}`);
@@ -337,6 +416,7 @@ async function cmdStatus() {
     ["service", `${dot(state === "active")} ${state}${core.hasSystemd() && core.serviceEnabled() ? c.dim(" (enabled at login)") : ""}`],
     ["proxy", live ? `${ui.sym.ok} ${core.baseUrl(cfg)}/v1 ${c.dim(`up ${live.uptime}`)}` : `${ui.sym.fail} not responding on ${core.baseUrl(cfg)}`],
     ["session", session],
+    ["listen", core.hostList(cfg).map((h) => (core.isLoopback(h) ? h : c.yellow(h))).join(", ") + c.dim(`  port ${cfg.PORT}`)],
     ["model", `${cfg.AGENT_MODEL} ${c.dim(`(${cfg.TOOLS_MODE}/${cfg.TOOLS_SHAPE})`)}`],
     ["requests", live ? `${live.stats.requests} total, ${live.stats.toolCalls} tool calls, ${live.stats.errors} errors, ${live.stats.retries} retries` : c.dim("-")],
     ["config", c.dim(core.CONFIG_FILE)],
@@ -414,6 +494,7 @@ async function main() {
   switch (cmd) {
     case "setup": case "install": return cmdSetup(o);
     case "login": return cmdLogin(o);
+    case "listen": return cmdListen(o);
     case "status": return cmdStatus();
     case "start": case "stop": case "restart": return cmdService(cmd);
     case "logs": return cmdLogs(o);

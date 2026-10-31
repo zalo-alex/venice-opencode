@@ -28,6 +28,7 @@ Then just run `opencode` and use the model `venice-web/deepseek-v4-1-flash-free`
 | `venice-opencode status` | Service, session, model and request counters |
 | `venice-opencode logs [-f]` | Service logs (journald) |
 | `venice-opencode restart` / `stop` / `start` | Control the service |
+| `venice-opencode listen [ADDR,...]` | Change which interfaces the proxy listens on (`--all`, `--local`, or pick interactively) |
 | `venice-opencode login` | Sign in again when the session expires |
 | `venice-opencode update` | Install the latest version and restart |
 | `venice-opencode setup --reconfigure` | Re-detect the tool protocol |
@@ -35,11 +36,24 @@ Then just run `opencode` and use the model `venice-web/deepseek-v4-1-flash-free`
 | `venice-opencode uninstall` | Remove the service, opencode entry and files |
 
 Setup options (also accepted by the installer: `... | bash -s -- --port 4000`):
-`--port N`, `--model ID`, `--json-mode`, `--all-models`, `--cookies FILE`, `--no-opencode`, `--no-service`, `-y/--yes`.
+`--port N`, `--host A,B`, `--model ID`, `--json-mode`, `--all-models`, `--cookies FILE`, `--no-opencode`, `--no-service`, `-y/--yes`.
 
 ## Dashboard
 
 Open `http://127.0.0.1:3456/` for a live status page: session validity, active model, request / tool-call / retry / error counters and recent activity. JSON is at `/api/status`.
+
+## Listening on other interfaces
+
+By default the proxy only listens on `127.0.0.1`. To reach it from another machine or container:
+
+```bash
+venice-opencode listen                         # interactive picker (lists your interfaces)
+venice-opencode listen 127.0.0.1,192.168.1.20  # specific addresses
+venice-opencode listen --all                   # every interface (0.0.0.0)
+venice-opencode listen --local                 # back to loopback only
+```
+
+The setting is `HOST` in `config.env` (comma-separated); the service restarts automatically. **The proxy has no authentication**, so anyone who can reach it can use your Venice session. Only expose it on a trusted network or behind a firewall/VPN.
 
 ## Files
 
