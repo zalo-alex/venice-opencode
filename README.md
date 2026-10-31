@@ -74,6 +74,10 @@ The setting is `HOST` in `config.env` (comma-separated); the service restarts au
 
 opencode speaks OpenAI chat-completions to `127.0.0.1:3456`. The proxy turns each request into a Venice web agent call, using your session, and translates the reply (including tool calls) back. Venice's agent sometimes swallows or mangles tool calls, so the proxy retries, repairs malformed JSON and maps near-miss tool names onto the ones opencode registered.
 
+## Unattended runs
+
+Venice's agent often swallows or garbles a tool call. The proxy never hands that back to opencode as a final answer (which would stop the run): it retries the turn with backoff, alternating native and text tool protocols and reminding the model of the valid tool names, until it gets a real tool call or answer. It also repairs common malformed calls (missing `"name"`, leaked `</｜DSML｜>` markup) and keeps the stream alive with SSE heartbeats during long retries. It only gives up if the Venice session is dead (`venice-opencode login`). Set `MAX_TRIES=N` in `config.env` for a hard limit (default `0` = unlimited).
+
 ## Troubleshooting
 
 - **`status` shows the session expired** → `venice-opencode login`.
