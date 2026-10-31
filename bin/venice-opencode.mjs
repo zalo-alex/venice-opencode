@@ -391,7 +391,7 @@ async function cmdUninstall(o) {
     core.removeUnit();
     ui.ok("Removed the systemd service");
   }
-  if (core.unwireOpencode()) ui.ok("Removed the Venice provider from the opencode config");
+  if (core.unwireOpencode(core.readConfig())) ui.ok("Removed the Venice provider from the opencode config");
   fs.rmSync(BIN_LINK, { force: true });
   const wipe = !interactive(o) || (await ui.confirm("Also delete your saved session and config?", true));
   if (wipe) {
