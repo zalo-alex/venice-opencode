@@ -278,7 +278,7 @@ async function cmdSetup(o) {
     healthy = await ui.spin("Waiting for the proxy", async () => {
       if (!(await core.waitForProxy(cfg))) throw new Error("proxy did not come up - see: venice-opencode logs");
       return "";
-    }).catch((e) => { ui.fail(e.message); return false; });
+    }).then(() => true, (e) => { ui.fail(e.message); return false; });
     if (healthy) {
       await ui.spin("Asking the model to call a tool", async () => {
         const res = await fetch(`${core.baseUrl(cfg)}/v1/chat/completions`, {
