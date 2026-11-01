@@ -147,14 +147,18 @@ const JSON_RULES = [
   "If no tool is needed, reply with normal text only.",
 ].join("\n");
 
+// Lets the proxy tell a finished task from a turn that merely stopped writing tool calls.
+const DONE_MARK = "TASK_COMPLETE";
+const DONE_RULE = `While work remains, every reply must end with a tool call. Only when the whole task is fully done, end your final reply with a line containing only ${DONE_MARK}. Never ask the user questions; decide and proceed.`;
+
 function toolPreamble(tools) {
   if (!tools?.length) return "";
   const sig = tools.filter(t => t?.function?.name).map(t => JSON.stringify({
     name: t.function.name, description: t.function.description || "",
     parameters: t.function.parameters || {} })).join("\n");
   if (TOOLS_MODE === "json")
-    return `[System]\n${JSON_RULES}\n\nAvailable tools:\n${sig}\n\n`;
-  return `[System]\nState in one short line what you intend to do, then call the tool by its exact name. One tool at a time.\n\n`;
+    return `[System]\n${JSON_RULES}\n${DONE_RULE}\n\nAvailable tools:\n${sig}\n\n`;
+  return `[System]\nState in one short line what you intend to do, then call the tool by its exact name. One tool at a time.\n${DONE_RULE}\n\n`;
 }
 
 function toItems(messages, tools) {
@@ -398,6 +402,8 @@ const NUDGE = '[System]\nYour previous reply did not contain a usable tool call.
 
 const CONTINUE = '[System]\ncontinue - now emit the tool call for the step you just announced: one short line, then on its own line the JSON object {"tool_calls":[{"name":"<tool>","arguments":{...}}]} and nothing else. Inside JSON strings escape every double quote as \\" and every backslash as \\.';
 
+const CONTINUE_NATIVE = `[System]\ncontinue - the task is not finished. Call the next tool now. Only if everything is truly done, end your reply with a line containing only ${DONE_MARK}. Do not ask questions; decide and proceed.`;
+
 // `retry` > 0 marks a re-attempt after a swallowed/missing call and adds a nudge. `native`
 // registers the tools with Venice so it hands native calls back instead of swallowing them.
 const openStream = async (body, force = false, retry = 0, prior = "", native = false) => {
@@ -405,10 +411,10 @@ const openStream = async (body, force = false, retry = 0, prior = "", native = f
   const items = toItems(body.messages, body.tools);
   const say = (role, text) => items.push({ type: "message", role, id: rid(), status: "completed",
     content: [{ type: "output_text", text, annotations: [] }] });
-  if (retry && TOOLS_MODE === "json" && body.tools?.length) {
+  if (retry && body.tools?.length && (TOOLS_MODE === "json" || prior)) {
     // Same thing a manual "continue" does: show the model its own announcement and ask again.
     if (prior) say("assistant", prior);
-    say("user", (prior ? CONTINUE : NUDGE) + valid);
+    say("user", (TOOLS_MODE !== "json" ? CONTINUE_NATIVE : prior ? CONTINUE : NUDGE) + valid);
   }
   return client.openAgentChatStream(await auth(force), items,
     { agentModelId: body.model && body.model !== "default" ? body.model : AGENT_MODEL,
@@ -542,7 +548,7 @@ const handler = async (req, res) => {
       if (TOOLS_MODE === "json") {
         const parsed = parseJsonCalls(t.text, resolve, new Set(names));
         if (parsed) { t.calls = parsed.calls; t.rest = parsed.rest; }
-        else if (/"tool_calls"|"name"\s*:/.test(t.text)) {
+        else if (/"tool_calls"|"name"\s*:|<tool[ _]?calls?>/i.test(t.text)) {
           t.badCall = true;
           process.stderr.write(`[parse-fail] ${JSON.stringify(t.text).slice(0, 1500)}\n`);
         }
@@ -562,8 +568,19 @@ const handler = async (req, res) => {
       && (/^(i'?ll|i will|i'm going to|let me|now|next|first|continuing|checking|pulling|trying|testing|time to|reading|writing|running|creating|searching|looking)\b/i.test(t.rest.trim())
         || /:\s*$/.test(t.rest.trim()));
     const fatal = (t) => /no valid Venice session|HTTP 40[13]\b/.test(t.error || "");
+    // Mid-loop (last message is a tool result) a text-only reply usually means the model lost the
+    // thread, not that it is done. Re-prompt a few times unless it signals completion.
+    const lastMsg = [...(body.messages || [])].reverse().find(m => m?.role !== "system");
+    const midTask = names.length > 0 && lastMsg?.role === "tool";
+    const MAX_CONTINUE = 3;
+    const isDone = (t) => new RegExp(`\\b${DONE_MARK}\\b`).test(t.rest);
     const getTurn = async (onReasoning) => {
-      let t = null, soft = null, announced = 0, authFails = 0;
+      const t = await runTurn(onReasoning);
+      t.rest = t.rest.replace(new RegExp(`\\s*\\b${DONE_MARK}\\b\\.?`, "g"), "").trim();
+      return t;
+    };
+    const runTurn = async (onReasoning) => {
+      let t = null, soft = null, announced = 0, authFails = 0, continued = 0;
       // Alternate between the two styles, starting with the one that has been working; every
       // 10th turn starts with text anyway so a recovered Venice is noticed.
       const preferNative = names.length > 0 && nativeScore > 0.5 && ++turnCount % 10 !== 0;
@@ -581,11 +598,13 @@ const handler = async (req, res) => {
         const label = MAX_TRIES ? `${attempt}/${MAX_TRIES}` : String(attempt);
         if (t.rest.trim()) {
           const announce = !t.swallowed && !t.badCall && announcesOnly(t);
-          if (!t.swallowed && !t.badCall && !announce) return t;
+          const lostThread = midTask && !t.swallowed && !t.badCall && !isDone(t);
+          if (!t.swallowed && !t.badCall && !announce && !lostThread) return t;
           if (announce && ++announced > MAX_ANNOUNCE) return t;
+          if (lostThread && !announce && ++continued > MAX_CONTINUE) return t;
           soft = t;
           stats.retries++;
-          process.stderr.write(`[retry ${label}] ${t.swallowed ? `Venice swallowed a ${t.swallowed} call` : t.badCall ? "tool call was not valid JSON" : "announced a step without a call"}: ${JSON.stringify(t.rest.trim().slice(0, 160))}\n`);
+          process.stderr.write(`[retry ${label}] ${t.swallowed ? `Venice swallowed a ${t.swallowed} call` : t.badCall ? "tool call was not valid JSON" : announce ? "announced a step without a call" : "text-only reply mid-task, asking it to continue"}: ${JSON.stringify(t.rest.trim().slice(0, 160))}\n`);
         } else {
           stats.retries++;
           process.stderr.write(`[retry ${label}] ${t.error || "no text/call"} :: ${t.trace.join(" > ")}\n`);
@@ -609,7 +628,7 @@ const handler = async (req, res) => {
       const what = t.calls.length ? `tool ${t.calls.map(c => resolve(c.name)).join(", ")}` : "text reply";
       const secs = ((Date.now() - began) / 1000).toFixed(1);
       remember({ model, what, secs, ok: !failed });
-      log("req", `${model} tools=${names.length} -> ${what} (${secs}s)`);
+      log("req", `${model} tools=${names.length} -> ${what} (${secs}s)${t.calls.length ? "" : ` ${JSON.stringify(t.rest.slice(0, 160))}`}`);
     };
 
     if (!body.stream) {
