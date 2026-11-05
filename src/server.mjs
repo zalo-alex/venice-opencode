@@ -11,6 +11,16 @@ const TOOLS_MODE = process.env.TOOLS_MODE || "client";
 const TOOLS_SHAPE = process.env.TOOLS_SHAPE || "mcp";
 const ALL_MODELS = process.env.ALL_MODELS === "1";
 const DEBUG = !!process.env.VENICE_DEBUG;
+// Benchmarked improvements. Defaults are the winning set; override with
+// FLAGS=... (FLAGS= empty restores the old behaviour).
+//   S1 goal anchor in continuations   G1 strip leaked <think>   R4 slim tool descriptions
+//   T1 per-attempt deadline           R2 abort stream on swallowed call
+//   L1 stream prose live              C1 estimated token usage
+// Off by default (no gain or harmful in benchmarks): R1 adaptive protocol, R5 arg validation, L4 bounded retries.
+const DEFAULT_FLAGS = "S1,G1,R4,T1,R2,L1,C1";
+const FLAGS = new Set((process.env.FLAGS ?? DEFAULT_FLAGS).split(",").map(f => f.trim().toUpperCase()).filter(Boolean));
+const on = (f) => FLAGS.has(f) || FLAGS.has("ALL");
+const metricsLog = [];
 
 const client = new VeniceWebClient({});
 let jwt = null;
@@ -120,6 +130,35 @@ function cleanSchema(node, depth = 0) {
   return out;
 }
 
+// R4: opencode tool descriptions run to thousands of chars; trim them so the model sees a small prompt.
+function slim(node, depth = 0) {
+  if (!node || typeof node !== "object" || depth > 8) return node;
+  if (Array.isArray(node)) return node.map(n => slim(n, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(node)) {
+    out[k] = k === "description" && typeof v === "string" ? v.split("\n")[0].slice(0, 160) : slim(v, depth + 1);
+  }
+  return out;
+}
+const toolDesc = (t) => on("R4") ? String(t.function.description || "").split("\n")[0].slice(0, 300) : t.function.description || "";
+const toolParams = (t) => on("R4") ? slim(t.function.parameters || {}) : t.function.parameters || {};
+
+// R5: check the call's arguments against the tool schema so a malformed call is retried, not executed.
+function argError(tools, name, argsJson) {
+  const schema = (tools || []).find(t => t?.function?.name === name)?.function?.parameters;
+  if (!schema || typeof schema !== "object") return null;
+  let a; try { a = JSON.parse(argsJson); } catch { return "arguments are not valid JSON"; }
+  if (!a || typeof a !== "object" || Array.isArray(a)) return "arguments must be a JSON object";
+  for (const k of schema.required || []) if (a[k] === undefined || a[k] === null) return `missing required argument "${k}"`;
+  for (const [k, def] of Object.entries(schema.properties || {})) {
+    if (a[k] === undefined || !def?.type || typeof def.type !== "string") continue;
+    const ty = Array.isArray(a[k]) ? "array" : a[k] === null ? "null" : typeof a[k];
+    const want = def.type === "integer" ? "number" : def.type;
+    if (ty !== want) return `argument "${k}" must be ${def.type}, got ${ty}`;
+  }
+  return null;
+}
+
 const validArgs = (a) => {
   if (a && typeof a === "object") return JSON.stringify(a);
   if (typeof a === "string") {
@@ -130,8 +169,8 @@ const validArgs = (a) => {
 
 function toClientTools(tools) {
   return (tools || []).filter(t => t?.function?.name).map(t => {
-    const base = { name: t.function.name, description: t.function.description || "",
-      inputSchema: cleanSchema(t.function.parameters || { type: "object", properties: {} }) };
+    const base = { name: t.function.name, description: toolDesc(t),
+      inputSchema: cleanSchema(on("R4") ? slim(t.function.parameters || { type: "object", properties: {} }) : t.function.parameters || { type: "object", properties: {} }) };
     if (TOOLS_SHAPE === "mcp_typed") return { type: "function", ...base };
     if (TOOLS_SHAPE === "flat") return { type: "function", name: base.name,
       description: base.description, parameters: base.inputSchema };
@@ -154,8 +193,8 @@ const DONE_RULE = `While work remains, every reply must end with a tool call. On
 function toolPreamble(tools) {
   if (!tools?.length) return "";
   const sig = tools.filter(t => t?.function?.name).map(t => JSON.stringify({
-    name: t.function.name, description: t.function.description || "",
-    parameters: t.function.parameters || {} })).join("\n");
+    name: t.function.name, description: toolDesc(t),
+    parameters: toolParams(t) })).join("\n");
   if (TOOLS_MODE === "json")
     return `[System]\n${JSON_RULES}\n${DONE_RULE}\n\nAvailable tools:\n${sig}\n\n`;
   return `[System]\nState in one short line what you intend to do, then call the tool by its exact name. One tool at a time.\n${DONE_RULE}\n\n`;
@@ -176,6 +215,8 @@ function toItems(messages, tools) {
   for (const m of messages || [])
     for (const c of m?.tool_calls || []) if (c?.id) nameOf.set(c.id, c.function?.name || "tool");
   const lastIdx = (messages || []).length - 1;
+  const firstUser = flat((messages || []).find(m => m?.role === "user")?.content);
+  const doneSteps = (messages || []).filter(m => m?.role === "tool").length;
 
   let preUsed = false;
   for (const [i, m] of (messages || []).entries()) {
@@ -183,7 +224,9 @@ function toItems(messages, tools) {
     if (asText && m.role === "tool") {
       if (!text) continue;
       const tail = i === lastIdx
-        ? "\n\n[System]\nContinue with the next step of the original task using the TOOL PROTOCOL. Reply with plain text only once EVERY step is done.\n"
+        ? (on("S1")
+          ? `\n\n[System]\nORIGINAL TASK: ${String(firstUser).slice(0, 500)}\nSteps done so far: ${doneSteps}. Do the next missing step with the TOOL PROTOCOL. Do not repeat a step whose result you already have; verify at most once. When every part of the task is complete, reply with a short plain-text answer and ${DONE_MARK} on its own line.\n`
+          : "\n\n[System]\nContinue with the next step of the original task using the TOOL PROTOCOL. Reply with plain text only once EVERY step is done.\n")
         : "";
       out.push({ type: "message", role: "user", id: rid(), status: "completed",
         content: [{ type: "output_text", annotations: [],
@@ -312,6 +355,31 @@ function readCall(c, resolve, known) {
   return { name: resolve(name), args };
 }
 
+// Models sometimes answer in XML instead of JSON:
+//   <tool_calls><function name="read"><parameter name="filePath">/a</parameter></function></tool_calls>
+// Only tried when no JSON call was found. Values are coerced to the schema's declared type.
+function parseXmlCalls(text, resolve, tools) {
+  const calls = [];
+  const s = String(text || "");
+  for (const f of s.matchAll(/<(?:function|invoke)\s+name\s*=\s*["']([^"']+)["']\s*>([\s\S]*?)<\/(?:function|invoke)>/gi)) {
+    const name = resolve(f[1]);
+    const props = (tools || []).find(t => t?.function?.name === name)?.function?.parameters?.properties || {};
+    const args = {};
+    for (const p of f[2].matchAll(/<parameter\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi)) {
+      let v = p[2].replace(/^\n|\n$/g, "");
+      const ty = props[p[1]]?.type;
+      if (ty === "number" || ty === "integer") { const n = Number(v); if (v.trim() !== "" && !Number.isNaN(n)) v = n; }
+      else if (ty === "boolean") v = /^true$/i.test(v.trim());
+      else if (ty === "array" || ty === "object") { try { v = JSON.parse(v); } catch {} }
+      args[p[1]] = v;
+    }
+    calls.push({ call_id: rid(), name, arguments: JSON.stringify(args) });
+  }
+  if (!calls.length) return null;
+  const rest = s.replace(/<tool_calls?>[\s\S]*?(<\/tool_calls?>|$)/gi, " ").replace(/<(?:function|invoke)[\s\S]*?<\/(?:function|invoke)>/gi, " ").trim();
+  return { calls, rest };
+}
+
 function parseJsonCalls(text, resolve, known = new Set()) {
   // Code fences are left alone here: they may legitimately sit inside string arguments.
   const s = stripMarkup(text);
@@ -406,7 +474,7 @@ const CONTINUE_NATIVE = `[System]\ncontinue - the task is not finished. Call the
 
 // `retry` > 0 marks a re-attempt after a swallowed/missing call and adds a nudge. `native`
 // registers the tools with Venice so it hands native calls back instead of swallowing them.
-const openStream = async (body, force = false, retry = 0, prior = "", native = false) => {
+const openStream = async (body, force = false, retry = 0, prior = "", native = false, hint = "") => {
   const valid = toolList((body.tools || []).map(t => t?.function?.name).filter(Boolean));
   const items = toItems(body.messages, body.tools);
   const say = (role, text) => items.push({ type: "message", role, id: rid(), status: "completed",
@@ -414,7 +482,7 @@ const openStream = async (body, force = false, retry = 0, prior = "", native = f
   if (retry && body.tools?.length && (TOOLS_MODE === "json" || prior)) {
     // Same thing a manual "continue" does: show the model its own announcement and ask again.
     if (prior) say("assistant", prior);
-    say("user", (TOOLS_MODE !== "json" ? CONTINUE_NATIVE : prior ? CONTINUE : NUDGE) + valid);
+    say("user", (TOOLS_MODE !== "json" ? CONTINUE_NATIVE : prior ? CONTINUE : NUDGE) + valid + (hint ? ` Problem with your last call: ${hint}.` : ""));
   }
   return client.openAgentChatStream(await auth(force), items,
     { agentModelId: body.model && body.model !== "default" ? body.model : AGENT_MODEL,
@@ -424,8 +492,13 @@ const openStream = async (body, force = false, retry = 0, prior = "", native = f
 // Share of recent tool turns that only worked with native tools registered. When Venice keeps
 // swallowing the text-protocol call, start with native tools instead of paying for a retry.
 let nativeScore = 0, turnCount = 0;
+// R1: first-attempt success rate per protocol (EWMA, optimistic start); pick the better one, explore 10%.
+const proto = { native: 0.5, text: 0.5 };
+const protoWin = (isNative, ok) => { const k = isNative ? "native" : "text"; proto[k] = proto[k] * 0.8 + (ok ? 0.2 : 0); };
+const protoPick = () => Math.random() < 0.1 ? proto.native <= proto.text : proto.native > proto.text;
 
-const IDLE_MS = Number(process.env.IDLE_MS || 90_000);
+const IDLE_MS = Number(process.env.IDLE_MS || (on("T1") ? 25_000 : 90_000));
+const ATTEMPT_MS = Number(process.env.ATTEMPT_MS || 45_000);
 
 const handler = async (req, res) => {
   let clientGone = false;
@@ -448,6 +521,7 @@ const handler = async (req, res) => {
 
     const pathname = req.url.split("?")[0];
     if (req.method === "GET" && pathname === "/api/status") return send(res, 200, await statusInfo());
+    if (req.method === "GET" && pathname === "/api/metrics") return send(res, 200, { flags: [...FLAGS], proto, log: metricsLog });
     if (req.method === "GET" && pathname === "/health") return send(res, 200, { ok: true });
     if (req.method === "GET" && pathname === "/") {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
@@ -486,10 +560,10 @@ const handler = async (req, res) => {
       return t.includes("client") && t.includes("call");
     };
 
-    const openUp = async (retry = 0, prior = "", native = false) => {
-      try { return await openStream(body, false, retry, prior, native); }
+    const openUp = async (retry = 0, prior = "", native = false, hint = "") => {
+      try { return await openStream(body, false, retry, prior, native, hint); }
       catch (e) {
-        if (String(e).startsWith("HTTP 401")) return openStream(body, true, retry, prior, native);
+        if (String(e).startsWith("HTTP 401")) return openStream(body, true, retry, prior, native, hint);
         process.stderr.write(`[upstream] ${String(e).slice(0, 300)}\n`);
         throw e;
       }
@@ -505,13 +579,13 @@ const handler = async (req, res) => {
     // Reads one turn from upstream. Venice's agent runs its own loop (agent-node:llm:0, :1, ...):
     // it tries to execute tool calls it spots in the text, fails with "Tool not found", and keeps
     // generating until it writes a final answer. Only the first node is the turn opencode should see.
-    const readTurn = async (up, onReasoning) => {
+    const readTurn = async (up, onReasoning, onText = null, ctl = { stop: false }) => {
       const t = { text: "", thinking: "", calls: [], error: null, trace: [], raw: [] };
       const types = new Map();
       let firstNode = null;
       const it = up.events[Symbol.asyncIterator]();
       try {
-        while (!clientGone) {
+        while (!clientGone && !ctl.stop) {
           let timer;
           const next = await Promise.race([it.next(),
             new Promise(r => { timer = setTimeout(() => r(null), IDLE_MS); })]);
@@ -523,7 +597,8 @@ const handler = async (req, res) => {
           if (event && !event.endsWith("delta")) t.trace.push(event.replace(/^response\./, "") + (data?.item?.type ? ":" + data.item.type : ""));
           // Venice parsed a tool call out of the model output and tried to run it server-side.
           if (event === "veniceai:tool_call_generation.in_progress")
-            t.swallowed = (data?.detected_tools || []).map(d => d.name || d.tool).join(",") || "?";
+            { t.swallowed = (data?.detected_tools || []).map(d => d.name || d.tool).join(",") || "?";
+              if (on("R2")) break; }
           if (event === "response.failed" || data?.response?.status === "failed")
             t.error = data?.response?.error?.message || "upstream failed";
           if (event === "response.output_item.added" && data?.item?.id) {
@@ -534,7 +609,7 @@ const handler = async (req, res) => {
           }
           if (event === "response.output_text.delta" && typeof data?.delta === "string") {
             if (types.get(data.item_id) === "reasoning") { t.thinking += data.delta; onReasoning(data.delta); }
-            else t.text += data.delta;
+            else { t.text += data.delta; onText?.(t.text); }
           }
           if (event === "response.output_item.done" && isCall(data?.item)) t.calls.push(data.item);
           if (event === "response.completed")
@@ -544,14 +619,22 @@ const handler = async (req, res) => {
       finally { it.return?.()?.catch?.(() => {}); }
 
       t.text = stripMarkup(t.text);
+      if (on("G1")) { if (/<\/think>/i.test(t.text)) t.text = t.text.slice(t.text.search(/<\/think>/i) + 8); t.text = t.text.replace(/<think>[\s\S]*?(<\/think>|$)/gi, "").trim(); }
       t.rest = t.text;
       if (TOOLS_MODE === "json") {
-        const parsed = parseJsonCalls(t.text, resolve, new Set(names));
+        const parsed = parseJsonCalls(t.text, resolve, new Set(names)) || parseXmlCalls(t.text, resolve, body.tools);
         if (parsed) { t.calls = parsed.calls; t.rest = parsed.rest; }
-        else if (/"tool_calls"|"name"\s*:|<tool[ _]?calls?>/i.test(t.text)) {
+        else if (/"tool_calls"|"name"\s*:|<tool[ _]?calls?>|<function\s/i.test(t.text)) {
           t.badCall = true;
           process.stderr.write(`[parse-fail] ${JSON.stringify(t.text).slice(0, 1500)}\n`);
         }
+      }
+      if (on("R5") && t.calls.length) {
+        for (const c of t.calls) {
+          const err = argError(body.tools, resolve(c.name), validArgs(c.arguments ?? c.input));
+          if (err) { t.badArgs = `${resolve(c.name)}: ${err}`; t.badCall = true; t.calls = []; break; }
+        }
+        if (t.badArgs) process.stderr.write(`[bad-args] ${t.badArgs}\n`);
       }
       return t;
     };
@@ -560,7 +643,7 @@ const handler = async (req, res) => {
     // server-side, leaving nothing to forward. Returning that as a plain reply would end
     // opencode's loop with the task unfinished, so a turn is retried until it yields a tool call
     // or a real answer. MAX_TRIES=0 (default) means no limit; only a dead session gives up.
-    const MAX_TRIES = Number(process.env.MAX_TRIES || 0);
+    const MAX_TRIES = Number(process.env.MAX_TRIES ?? (on("L4") ? 8 : 0));
     // A reply that only announces the next step ("I'll write the file.") is retried too, but
     // only a few times: if the model insists, it probably is its answer.
     const MAX_ANNOUNCE = 5;
@@ -579,20 +662,32 @@ const handler = async (req, res) => {
       t.rest = t.rest.replace(new RegExp(`\\s*\\b${DONE_MARK}\\b\\.?`, "g"), "").trim();
       return t;
     };
-    const runTurn = async (onReasoning) => {
+    const runTurn = async (onReasoning, onText = null) => {
       let t = null, soft = null, announced = 0, authFails = 0, continued = 0;
       // Alternate between the two styles, starting with the one that has been working; every
       // 10th turn starts with text anyway so a recovered Venice is noticed.
-      const preferNative = names.length > 0 && nativeScore > 0.5 && ++turnCount % 10 !== 0;
+      const preferNative = names.length > 0 && (on("R1") ? protoPick() : nativeScore > 0.5 && ++turnCount % 10 !== 0);
       const nativeFor = (attempt) => names.length > 0 && (attempt % 2 === 1) === preferNative;
       for (let attempt = 1; (!MAX_TRIES || attempt <= MAX_TRIES) && !clientGone; attempt++) {
-        try { t = await readTurn(await openUp(attempt - 1, soft?.rest?.trim() || "", nativeFor(attempt)), onReasoning); }
+        try {
+          const ctl = { stop: false };
+          const work = (async () => readTurn(await openUp(attempt - 1, soft?.rest?.trim() || "", nativeFor(attempt), soft?.badArgs || ""), onReasoning, attempt === 1 ? onText : null, ctl))();
+          if (on("T1")) {
+            let tm; const dead = new Promise(r => { tm = setTimeout(() => { ctl.stop = true; r("dead"); }, ATTEMPT_MS); });
+            const got = await Promise.race([work, dead]); clearTimeout(tm);
+            if (got === "dead") { work.catch(() => {}); throw new Error(`attempt exceeded ${ATTEMPT_MS / 1000}s`); }
+            t = got;
+          } else t = await work;
+        }
         catch (e) { t = { text: "", rest: "", thinking: "", calls: [], error: String(e).slice(0, 200), trace: [], raw: [] }; }
         if (t.calls.length) {
           if (names.length) nativeScore = nativeScore * 0.7 + (nativeFor(attempt) ? 0.3 : 0);
+          if (names.length && attempt === 1) protoWin(nativeFor(1), true);
+          t.attempts = attempt;
           if (attempt > 1) process.stderr.write(`[recovered] attempt ${attempt}, ${nativeFor(attempt) ? "native tools" : "text protocol"}, call=${t.calls[0].name}\n`);
           return t;
         }
+        if (names.length && attempt === 1) protoWin(nativeFor(1), false);
         authFails = fatal(t) ? authFails + 1 : 0;
         if (authFails >= 4) break;
         const label = MAX_TRIES ? `${attempt}/${MAX_TRIES}` : String(attempt);
@@ -611,15 +706,23 @@ const handler = async (req, res) => {
           for (const r of t.raw || []) process.stderr.write(`    ${r}\n`);
         }
         // Back off gently (0.4s, 0.8s, ... capped at 15s) so a long Venice outage is not hammered.
-        await new Promise(r => setTimeout(r, Math.min(400 * attempt, 15_000)));
+        await new Promise(r => setTimeout(r, on("L4") ? Math.min(300 * 2 ** (attempt - 1), 8000) * (0.6 + Math.random() * 0.8) : Math.min(400 * attempt, 15_000)));
       }
       if (clientGone && t) return t;
       t = t || { text: "", thinking: "", calls: [], trace: [], raw: [] };
+      t.attempts = MAX_TRIES || 99;
       t.rest = `[venice upstream error: ${t.error || "empty response"}${authFails >= 4 ? " - run: venice-opencode login" : ""}]`;
       return t;
     };
 
     const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+    const estUsage = (t) => {
+      if (!on("C1")) return;
+      usage.prompt_tokens = Math.ceil(raw.length / 4);
+      usage.completion_tokens = Math.ceil((t.rest.length + t.thinking.length + t.calls.reduce((n, c) => n + JSON.stringify(c.arguments ?? c.input ?? "").length + 20, 0)) / 4);
+      usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+    };
+    let ttfb = null;
 
     const done = (t) => {
       stats.toolCalls += t.calls.length;
@@ -628,12 +731,15 @@ const handler = async (req, res) => {
       const what = t.calls.length ? `tool ${t.calls.map(c => resolve(c.name)).join(", ")}` : "text reply";
       const secs = ((Date.now() - began) / 1000).toFixed(1);
       remember({ model, what, secs, ok: !failed });
+      metricsLog.push({ ok: !failed, calls: t.calls.length, attempts: t.attempts || 1, ms: Date.now() - began, ttfb, text: t.rest.length });
+      if (metricsLog.length > 500) metricsLog.shift();
       log("req", `${model} tools=${names.length} -> ${what} (${secs}s)${t.calls.length ? "" : ` ${JSON.stringify(t.rest.slice(0, 160))}`}`);
     };
 
     if (!body.stream) {
       const t = await getTurn(() => {});
       done(t);
+      estUsage(t);
       const msg = { role: "assistant", content: t.rest.trim() || null };
       if (t.thinking.trim()) msg.reasoning_content = t.thinking.trim();
       if (t.calls.length) msg.tool_calls = t.calls.map((c, i) => emitCall(c, i));
@@ -649,11 +755,25 @@ const handler = async (req, res) => {
     chunk({ role: "assistant", content: "" });
     // Retries can take minutes; SSE comments keep the client and any proxy in between from timing out.
     const beat = setInterval(() => { if (!clientGone) res.write(": keepalive\n\n"); }, 10_000);
-    let t;
-    try { t = await getTurn((d) => chunk({ reasoning_content: d })); }
+    let t, sent = "";
+    // L1: forward the prose of the first attempt as it arrives (up to where JSON starts, minus a
+    // tail that could still turn out to be the completion marker), instead of after the whole turn.
+    const live = !on("L1") ? null : (full) => {
+      const cut = full.search(/\{\s*"|<tool|｜/);
+      const upto = cut >= 0 ? cut : full.length - DONE_MARK.length - 2;
+      const piece = full.slice(sent.length, Math.max(sent.length, upto));
+      if (piece && (sent || piece.trim())) { sent += piece; ttfb ??= Date.now() - began; chunk({ content: piece }); }
+    };
+    try { t = await getTurn((d) => { ttfb ??= Date.now() - began; chunk({ reasoning_content: d }); }, live); }
     finally { clearInterval(beat); }
     done(t);
-    if (t.rest.trim()) chunk({ content: t.rest.trim() });
+    estUsage(t);
+    const body2 = t.rest.trim();
+    if (body2) {
+      if (!sent) { ttfb ??= Date.now() - began; chunk({ content: body2 }); }
+      else if (body2.startsWith(sent.trim())) { if (body2.length > sent.trim().length) chunk({ content: body2.slice(sent.trim().length) }); }
+      else chunk({ content: "\n\n" + body2 });
+    }
     t.calls.forEach((c, i) => chunk({ tool_calls: [emitCall(c, i)] }));
     chunk({}, t.calls.length ? "tool_calls" : "stop", { usage });
     res.write("data: [DONE]\n\n");
