@@ -1,6 +1,7 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
 import { VeniceWebClient, decodeJwtPayload } from "./client.mjs";
 
 const PORT = Number(process.env.PORT || 3456);
@@ -16,11 +17,17 @@ const DEBUG = !!process.env.VENICE_DEBUG;
 //   S1 goal anchor in continuations   G1 strip leaked <think>   R4 slim tool descriptions
 //   T1 per-attempt deadline           R2 abort stream on swallowed call
 //   L1 stream prose live              C1 estimated token usage
-// Off by default (no gain or harmful in benchmarks): R1 adaptive protocol, R5 arg validation, L4 bounded retries.
-const DEFAULT_FLAGS = "S1,G1,R4,T1,R2,L1,C1";
+//   R1 adaptive protocol: start with whichever of native/text tools has been succeeding (real traffic: ~40% first-try success
+//      for text, so picking per live stats beats a fixed order; the small-prompt bench could not show this)
+//   X3 plain-text block call protocol (>>> tool x / ::arg / <<<). Venice's server-side call detector
+//      swallows JSON- and XML-shaped calls (~50% of first attempts on real traffic); block form: ~6%.
+// Off by default (no gain or harmful in benchmarks): R5 arg validation, L4 bounded retries.
+//   K1 take a tool call the model wrote into its reasoning channel when the visible reply is empty (diagnostic [reasoning-call] logs always on)
+const DEFAULT_FLAGS = "S1,G1,R4,T1,R2,L1,C1,R1,X3";
 const FLAGS = new Set((process.env.FLAGS ?? DEFAULT_FLAGS).split(",").map(f => f.trim().toUpperCase()).filter(Boolean));
 const on = (f) => FLAGS.has(f) || FLAGS.has("ALL");
 const metricsLog = [];
+const DUMP_DIR = process.env.DUMP_DIR || "";
 
 const client = new VeniceWebClient({});
 let jwt = null;
@@ -29,6 +36,23 @@ let lastTools = [];
 const VERSION = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 const startedAt = Date.now();
 const stats = { requests: 0, toolCalls: 0, errors: 0, retries: 0 };
+
+// Venice enforces a daily quota on the agent endpoint (HTTP 429, x-ratelimit-resets). Retrying into it
+// only burns requests, so: remember the reset time, answer locally until then, and count upstream
+// requests in a rolling 24h window so the size of the limit is visible when it trips.
+const DAY = 24 * 3600_000;
+const upstreamLog = [];
+let limitedUntil = 0, limitInfo = null, strikes = 0;
+const used24h = () => { const cut = Date.now() - DAY; while (upstreamLog.length && upstreamLog[0] < cut) upstreamLog.shift(); return upstreamLog.length; };
+const fmtClock = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const limitMessage = () => `[venice rate limit reached - no requests will be sent until ${fmtClock(limitedUntil)} (in ${Math.max(1, Math.ceil((limitedUntil - Date.now()) / 60000))} min). Retrying earlier would not help.]`;
+const noteLimit = (e) => {
+  strikes++;
+  // Without a reset header back off exponentially (5, 10, 20, ... up to 60 min).
+  limitedUntil = e.resetAt || Date.now() + Math.min(5 * 2 ** (strikes - 1), 60) * 60_000;
+  limitInfo = { at: Date.now(), type: e.limitType || null, usedInWindow: used24h(), resetsAt: limitedUntil };
+  log("limit", `Venice rate limit (${e.limitType || "?"}) after ${limitInfo.usedInWindow} requests in 24h; paused until ${new Date(limitedUntil).toISOString()}`);
+};
 const recent = [];
 const log = (kind, msg) => process.stderr.write(`[${kind}] ${msg}\n`);
 const remember = (entry) => { recent.unshift({ t: Date.now(), ...entry }); recent.length = Math.min(recent.length, 25); };
@@ -47,7 +71,7 @@ async function statusInfo() {
   } catch (e) { session.error = String(e.message || e); }
   return { version: VERSION, uptime: fmtUptime(Date.now() - startedAt),
     model: AGENT_MODEL, mode: TOOLS_MODE, shape: TOOLS_SHAPE, allModels: ALL_MODELS,
-    listen: HOSTS.map(h => `${h}:${PORT}`), session, stats, recent: recent.map(r => ({ ...r, ago: fmtUptime(Date.now() - r.t) })) };
+    listen: HOSTS.map(h => `${h}:${PORT}`), session, stats, rateLimit: { limitedUntil: limitedUntil > Date.now() ? limitedUntil : null, last: limitInfo, requestsLast24h: used24h() }, recent: recent.map(r => ({ ...r, ago: fmtUptime(Date.now() - r.t) })) };
 }
 
 const usable = (t) => {
@@ -178,6 +202,58 @@ function toClientTools(tools) {
   });
 }
 
+// X3: plain-text block protocol, nothing JSON- or XML-shaped for Venice's call detector to latch onto.
+//   >>> tool shell
+//   ::command
+//   ls -la
+//   <<<
+const blockCalls = (calls) => calls.map(c => ">>> tool " + c.name + "\n" + Object.entries(c.arguments || {}).map(([k, v]) =>
+  "::" + k + "\n" + (typeof v === "string" ? v : JSON.stringify(v))).join("\n") + "\n<<<").join("\n");
+const BLOCK_RULES = [
+  "TOOL PROTOCOL: first write ONE short line saying what you are about to do,",
+  "then the call as a block, exactly in this layout (nothing after it):",
+  ">>> tool <name>",
+  "::<argument name>",
+  "<argument value, raw text, exactly as it must be passed, no quoting or escaping>",
+  "<<<",
+  "Example (the tool and argument names come from the list below; never write the angle brackets):",
+  ">>> tool read",
+  "::filePath",
+  "/src/app.py",
+  "<<<",
+  "Repeat a ::name line plus its value for each argument. Numbers/booleans/lists as JSON text.",
+  "Use the EXACT tool names listed below. One tool per turn.",
+  "If no tool is needed, reply with normal text only.",
+].join("\n");
+const NUDGE_B = "[System]\nYour previous reply did not contain a usable tool call. Reply again: one short line, then the block:\n>>> tool <name>\n::<argument name>\n<value>\n<<<";
+function parseBlockCalls(text, resolve, tools) {
+  const s = String(text || ""), calls = [];
+  const re = />>>\s*tool\s+([^\s]+)[ \t]*\n([\s\S]*?)(?:\n<<<|$)/g;
+  let m, rest = s;
+  while ((m = re.exec(s))) {
+    const name = resolve(m[1]);
+    const props = (tools || []).find(t => t?.function?.name === name)?.function?.parameters?.properties || {};
+    const args = {};
+    for (const part of ("\n" + m[2]).split(/\n::/).slice(1)) {
+      const nl = part.indexOf("\n"); const head = (nl < 0 ? part : part.slice(0, nl)).trim();
+      // "::name" on its own line (canonical) or "::name value" on one line (tolerated)
+      const sp = head.search(/\s/);
+      let k = (sp < 0 ? head : head.slice(0, sp)).replace(/^<+|>+$/g, "");
+      let v = nl < 0 ? "" : part.slice(nl + 1);
+      if (sp >= 0) v = head.slice(sp).trim() + (nl < 0 ? "" : "\n" + part.slice(nl + 1)).replace(/^\n$/, "");
+      const pk = Object.keys(props).find(x => x === k) || Object.keys(props).find(x => x.toLowerCase().replace(/_/g, "") === k.toLowerCase().replace(/_/g, ""));
+      if (pk) k = pk;
+      const ty = props[k]?.type;
+      if (ty === "number" || ty === "integer") { const n = Number(v); if (v.trim() !== "" && !Number.isNaN(n)) v = n; }
+      else if (ty === "boolean") v = /^true$/i.test(v.trim());
+      else if (ty === "array" || ty === "object") { try { v = JSON.parse(v); } catch {} }
+      args[k] = v;
+    }
+    calls.push({ call_id: rid(), name, arguments: JSON.stringify(args) });
+    rest = rest.replace(m[0], " ");
+  }
+  return calls.length ? { calls, rest: rest.trim() } : null;
+}
 const JSON_RULES = [
   "TOOL PROTOCOL: first write ONE short line saying what you are about to do,",
   "then on its own line a single JSON object and nothing else:",
@@ -196,7 +272,7 @@ function toolPreamble(tools) {
     name: t.function.name, description: toolDesc(t),
     parameters: toolParams(t) })).join("\n");
   if (TOOLS_MODE === "json")
-    return `[System]\n${JSON_RULES}\n${DONE_RULE}\n\nAvailable tools:\n${sig}\n\n`;
+    return `[System]\n${on("X3") ? BLOCK_RULES : JSON_RULES}\n${DONE_RULE}\n\nAvailable tools:\n${sig}\n\n`;
   return `[System]\nState in one short line what you intend to do, then call the tool by its exact name. One tool at a time.\n${DONE_RULE}\n\n`;
 }
 
@@ -238,7 +314,7 @@ function toItems(messages, tools) {
         let a; try { a = JSON.parse(validArgs(c.function?.arguments)); } catch { a = {}; }
         return { name: c.function?.name || "", arguments: a };
       });
-      const said = [text, calls.length ? JSON.stringify({ tool_calls: calls }) : ""].filter(Boolean).join("\n\n");
+      const said = [text, calls.length ? (on("X3") ? blockCalls(calls) : JSON.stringify({ tool_calls: calls })) : ""].filter(Boolean).join("\n\n");
       if (said) out.push({ type: "message", role: "assistant", id: rid(), status: "completed",
         content: [{ type: "output_text", text: said, annotations: [] }] });
       continue;
@@ -482,7 +558,7 @@ const openStream = async (body, force = false, retry = 0, prior = "", native = f
   if (retry && body.tools?.length && (TOOLS_MODE === "json" || prior)) {
     // Same thing a manual "continue" does: show the model its own announcement and ask again.
     if (prior) say("assistant", prior);
-    say("user", (TOOLS_MODE !== "json" ? CONTINUE_NATIVE : prior ? CONTINUE : NUDGE) + valid + (hint ? ` Problem with your last call: ${hint}.` : ""));
+    say("user", (TOOLS_MODE !== "json" ? CONTINUE_NATIVE : on("X3") ? NUDGE_B : prior ? CONTINUE : NUDGE) + valid + (hint ? ` Problem with your last call: ${hint}.` : ""));
   }
   return client.openAgentChatStream(await auth(force), items,
     { agentModelId: body.model && body.model !== "default" ? body.model : AGENT_MODEL,
@@ -542,6 +618,10 @@ const handler = async (req, res) => {
     catch { return send(res, 400, { error: { message: "invalid JSON body" } }); }
     stats.requests++;
     const began = Date.now();
+    const dumpId = Date.now().toString(36) + "-" + rid().slice(0, 6);
+    // DUMP_DIR: opt-in capture of request bodies + per-attempt outcomes, to analyse why Venice swallows calls.
+    const dump = (name, obj) => { if (!DUMP_DIR) return; try { fs.mkdirSync(DUMP_DIR, { recursive: true, mode: 0o700 }); fs.appendFileSync(path.join(DUMP_DIR, name), JSON.stringify(obj) + "\n", { mode: 0o600 }); } catch {} };
+    dump("bodies.jsonl", { id: dumpId, t: Date.now(), body });
     const model = body.model || AGENT_MODEL;
     const created = Math.floor(Date.now() / 1000);
     const id = "chatcmpl-" + rid();
@@ -561,9 +641,12 @@ const handler = async (req, res) => {
     };
 
     const openUp = async (retry = 0, prior = "", native = false, hint = "") => {
+      if (limitedUntil > Date.now()) { const e = new Error("HTTP 429: paused until reset"); e.status = 429; e.local = true; throw e; }
+      upstreamLog.push(Date.now());
       try { return await openStream(body, false, retry, prior, native, hint); }
       catch (e) {
-        if (String(e).startsWith("HTTP 401")) return openStream(body, true, retry, prior, native, hint);
+        if (String(e).startsWith("HTTP 401")) { upstreamLog.push(Date.now()); return openStream(body, true, retry, prior, native, hint); }
+        if (e.status === 429 && !e.local) noteLimit(e);
         process.stderr.write(`[upstream] ${String(e).slice(0, 300)}\n`);
         throw e;
       }
@@ -622,9 +705,15 @@ const handler = async (req, res) => {
       if (on("G1")) { if (/<\/think>/i.test(t.text)) t.text = t.text.slice(t.text.search(/<\/think>/i) + 8); t.text = t.text.replace(/<think>[\s\S]*?(<\/think>|$)/gi, "").trim(); }
       t.rest = t.text;
       if (TOOLS_MODE === "json") {
-        const parsed = parseJsonCalls(t.text, resolve, new Set(names)) || parseXmlCalls(t.text, resolve, body.tools);
+        let parsed = parseJsonCalls(t.text, resolve, new Set(names)) || parseXmlCalls(t.text, resolve, body.tools) || parseBlockCalls(t.text, resolve, body.tools);
+        if (!parsed && !t.text.trim() && t.thinking && /"tool_calls"|"name"\s*:/.test(t.thinking)) {
+          // Empty visible reply but the reasoning holds a call: Venice's interceptor may have eaten the visible copy.
+          const alt = parseJsonCalls(t.thinking, resolve, new Set(names));
+          process.stderr.write(`[reasoning-call] ${alt ? "parsed " + alt.calls.map(c => c.name).join(",") : "unparsable"} :: ${JSON.stringify(t.thinking.slice(-300))}\n`);
+          if (alt && on("K1")) parsed = { calls: alt.calls, rest: "" };
+        }
         if (parsed) { t.calls = parsed.calls; t.rest = parsed.rest; }
-        else if (/"tool_calls"|"name"\s*:|<tool[ _]?calls?>|<function\s/i.test(t.text)) {
+        else if (/"tool_calls"|"name"\s*:|<tool[ _]?calls?>|<function\s|^>>>\s*tool\b/im.test(t.text)) {
           t.badCall = true;
           process.stderr.write(`[parse-fail] ${JSON.stringify(t.text).slice(0, 1500)}\n`);
         }
@@ -650,7 +739,7 @@ const handler = async (req, res) => {
     const announcesOnly = (t) => names.length && !t.calls.length && t.rest.trim().length < 300
       && (/^(i'?ll|i will|i'm going to|let me|now|next|first|continuing|checking|pulling|trying|testing|time to|reading|writing|running|creating|searching|looking)\b/i.test(t.rest.trim())
         || /:\s*$/.test(t.rest.trim()));
-    const fatal = (t) => /no valid Venice session|HTTP 40[13]\b/.test(t.error || "");
+    const fatal = (t) => /no valid Venice session|Missing required credential|HTTP 40[13]\b/.test(t.error || "");
     // Mid-loop (last message is a tool result) a text-only reply usually means the model lost the
     // thread, not that it is done. Re-prompt a few times unless it signals completion.
     const lastMsg = [...(body.messages || [])].reverse().find(m => m?.role !== "system");
@@ -669,6 +758,7 @@ const handler = async (req, res) => {
       const preferNative = names.length > 0 && (on("R1") ? protoPick() : nativeScore > 0.5 && ++turnCount % 10 !== 0);
       const nativeFor = (attempt) => names.length > 0 && (attempt % 2 === 1) === preferNative;
       for (let attempt = 1; (!MAX_TRIES || attempt <= MAX_TRIES) && !clientGone; attempt++) {
+        if (limitedUntil > Date.now()) break;
         try {
           const ctl = { stop: false };
           const work = (async () => readTurn(await openUp(attempt - 1, soft?.rest?.trim() || "", nativeFor(attempt), soft?.badArgs || ""), onReasoning, attempt === 1 ? onText : null, ctl))();
@@ -680,6 +770,7 @@ const handler = async (req, res) => {
           } else t = await work;
         }
         catch (e) { t = { text: "", rest: "", thinking: "", calls: [], error: String(e).slice(0, 200), trace: [], raw: [] }; }
+        dump("attempts.jsonl", { id: dumpId, attempt, native: nativeFor(attempt), ok: !!t.calls.length, swallowed: t.swallowed || null, error: t.error || null, trace: t.trace, textLen: (t.text || "").length, textTail: (t.text || "").slice(-400), thinkTail: (t.thinking || "").slice(-600), badCall: !!t.badCall });
         if (t.calls.length) {
           if (names.length) nativeScore = nativeScore * 0.7 + (nativeFor(attempt) ? 0.3 : 0);
           if (names.length && attempt === 1) protoWin(nativeFor(1), true);
@@ -705,8 +796,13 @@ const handler = async (req, res) => {
           process.stderr.write(`[retry ${label}] ${t.error || "no text/call"} :: ${t.trace.join(" > ")}\n`);
           for (const r of t.raw || []) process.stderr.write(`    ${r}\n`);
         }
+        if (limitedUntil > Date.now()) break;
         // Back off gently (0.4s, 0.8s, ... capped at 15s) so a long Venice outage is not hammered.
         await new Promise(r => setTimeout(r, on("L4") ? Math.min(300 * 2 ** (attempt - 1), 8000) * (0.6 + Math.random() * 0.8) : Math.min(400 * attempt, 15_000)));
+      }
+      if (limitedUntil > Date.now()) {
+        const rl = { text: "", thinking: "", calls: [], trace: [], raw: [], attempts: 1 };
+        rl.rest = limitMessage(); rl.rateLimited = true; return rl;
       }
       if (clientGone && t) return t;
       t = t || { text: "", thinking: "", calls: [], trace: [], raw: [] };
@@ -726,7 +822,7 @@ const handler = async (req, res) => {
 
     const done = (t) => {
       stats.toolCalls += t.calls.length;
-      const failed = /^\[venice upstream error/.test(t.rest);
+      const failed = /^\[venice upstream error/.test(t.rest) || !!t.rateLimited;
       if (failed) stats.errors++;
       const what = t.calls.length ? `tool ${t.calls.map(c => resolve(c.name)).join(", ")}` : "text reply";
       const secs = ((Date.now() - began) / 1000).toFixed(1);

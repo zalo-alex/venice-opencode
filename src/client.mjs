@@ -964,7 +964,17 @@ export class VeniceWebClient {
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`HTTP ${response.status}: ${text}`);
+      const err = new Error(`HTTP ${response.status}: ${text}`);
+      err.status = response.status;
+      if (response.status === 429) {
+        // Venice sends x-ratelimit-resets (epoch ms) and sometimes retry-after (seconds).
+        const h = (k) => { try { return response.headers?.get?.(k) ?? null; } catch { return null; } };
+        const resets = Number(h("x-ratelimit-resets"));
+        const retryAfter = Number(h("retry-after"));
+        err.resetAt = resets > Date.now() ? resets : retryAfter > 0 ? Date.now() + retryAfter * 1000 : null;
+        err.limitType = h("x-ratelimit-type");
+      }
+      throw err;
     }
 
     return {
@@ -1115,8 +1125,17 @@ export class VeniceWebClient {
     return snapshot;
   }
 
+  // A refresh that fails because Venice is rate limiting, down or unreachable says nothing about
+  // whether the saved session is still good, so it must never cost the user their login.
+  isTransientError(e) {
+    return /^HTTP (408|425|429|5\d\d)\b/.test(String(e?.message || e))
+      || /fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|timeout|timed out|aborted|socket|network/i.test(String(e?.message || e));
+  }
+
   clearSavedSession() {
     if (this.sessionFile && fs.existsSync(this.sessionFile)) {
+      // Keep a copy: deleting the only copy of a login has already cost users their session once.
+      try { fs.copyFileSync(this.sessionFile, `${this.sessionFile}.bak`); fs.chmodSync(`${this.sessionFile}.bak`, 0o600); } catch {}
       fs.unlinkSync(this.sessionFile);
     }
   }
@@ -1170,7 +1189,8 @@ export class VeniceWebClient {
           },
           userSession,
         };
-      } catch {
+      } catch (e) {
+        if (this.isTransientError(e)) throw e;
         this.clearSavedSession();
       }
     }
@@ -1190,7 +1210,8 @@ export class VeniceWebClient {
           },
           userSession,
         };
-      } catch {
+      } catch (e) {
+        if (this.isTransientError(e)) throw e;
         this.clearSavedSession();
       }
     }
