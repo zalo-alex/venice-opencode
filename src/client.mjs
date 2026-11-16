@@ -984,6 +984,10 @@ export class VeniceWebClient {
   }
 
   async login() {
+    if (!this.hasLoginCredentials()) {
+      const err = new Error("No valid Venice session and no VENICE_EMAIL/VENICE_PASSWORD configured - run: venice-opencode login");
+      err.authInvalid = true; throw err;
+    }
     if (!this.email) {
       this.email = requiredCredential("VENICE_EMAIL");
     }
@@ -1092,15 +1096,68 @@ export class VeniceWebClient {
     };
   }
 
-  readSavedSession() {
-    if (!this.sessionFile || !fs.existsSync(this.sessionFile)) {
-      return null;
-    }
+  // Backups live next to the session as session.json.bak.<ms>; the newest few are kept. They are
+  // written atomically and never overwrite each other, so one bad moment cannot destroy the good copy.
+  listBackups() {
+    if (!this.sessionFile) return [];
+    const dir = path.dirname(this.sessionFile), base = path.basename(this.sessionFile);
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { return []; }
+    return names
+      .filter(n => n.startsWith(base + ".bak"))
+      .map(n => { const m = /\.bak\.(\d+)$/.exec(n); const full = path.join(dir, n);
+        let mt = 0; try { mt = fs.statSync(full).mtimeMs; } catch {}
+        return { file: full, ts: m ? Number(m[1]) : mt }; })   // legacy "session.json.bak" sorts by mtime
+      .sort((x, y) => y.ts - x.ts);
+  }
+
+  writeFileAtomic(file, text) {
+    const tmp = `${file}.tmp-${process.pid}-${nowMs()}`;
+    const fd = fs.openSync(tmp, "w", 0o600);
+    try { fs.writeSync(fd, text); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.chmodSync(tmp, 0o600);
+    fs.renameSync(tmp, file);
+  }
+
+  // Copy the current session aside (only when it differs from the newest backup) and prune.
+  backupSession({ keep = 5 } = {}) {
     try {
-      return safeJsonParse(fs.readFileSync(this.sessionFile, "utf8"));
-    } catch {
-      return null;
+      if (!this.sessionFile || !fs.existsSync(this.sessionFile)) return null;
+      const text = fs.readFileSync(this.sessionFile, "utf8");
+      if (!safeJsonParse(text)?.clerkJwt) return null;   // never back up junk over a good copy
+      const list = this.listBackups();
+      if (list[0] && fs.readFileSync(list[0].file, "utf8") === text) return list[0].file;
+      const dest = `${this.sessionFile}.bak.${nowMs()}`;
+      this.writeFileAtomic(dest, text);
+      for (const old of this.listBackups().slice(keep)) { try { fs.unlinkSync(old.file); } catch {} }
+      return dest;
+    } catch { return null; }
+  }
+
+  // session.json missing or unreadable but a backup exists: bring the newest valid one back.
+  restoreFromBackup() {
+    for (const b of this.listBackups()) {
+      try {
+        const text = fs.readFileSync(b.file, "utf8");
+        const snap = safeJsonParse(text);
+        if (!snap?.clerkJwt && !snap?.cookies) continue;
+        this.writeFileAtomic(this.sessionFile, text);
+        process.stderr.write(`[session] restored ${path.basename(this.sessionFile)} from ${path.basename(b.file)}\n`);
+        return snap;
+      } catch {}
     }
+    return null;
+  }
+
+  readSavedSession() {
+    if (!this.sessionFile) return null;
+    if (fs.existsSync(this.sessionFile)) {
+      try {
+        const snap = safeJsonParse(fs.readFileSync(this.sessionFile, "utf8"));
+        if (snap && typeof snap === "object") return snap;
+      } catch {}
+    }
+    return this.restoreFromBackup();
   }
 
   writeSavedSession(extra = {}) {
@@ -1121,23 +1178,50 @@ export class VeniceWebClient {
       cookies: this.cookies.export(),
       ...extra,
     };
-    fs.writeFileSync(this.sessionFile, JSON.stringify(snapshot, null, 2));
+    this.writeFileAtomic(this.sessionFile, JSON.stringify(snapshot, null, 2));
+    // A freshly validated session is worth keeping a copy of, at most once an hour.
+    const newest = this.listBackups()[0];
+    if (!newest || nowMs() - newest.ts > 3_600_000) this.backupSession();
     return snapshot;
   }
 
-  // A refresh that fails because Venice is rate limiting, down or unreachable says nothing about
-  // whether the saved session is still good, so it must never cost the user their login.
+  // Why a call failed, judged by the error's shape rather than its wording. Anything that is not
+  // positive proof of a dead session must leave the login alone.
   isTransientError(e) {
-    return /^HTTP (408|425|429|5\d\d)\b/.test(String(e?.message || e))
-      || /fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|timeout|timed out|aborted|socket|network/i.test(String(e?.message || e));
+    const chain = []; for (let x = e, i = 0; x && i < 5; x = x.cause, i++) chain.push(x);
+    const codes = /^(ECONN\w*|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|EPIPE|UND_ERR_\w+)$/;
+    if (chain.some(x => typeof x?.code === "string" && codes.test(x.code))) return true;
+    if (chain.some(x => /^(RequestError|AbortError|TimeoutError|FetchError)$/.test(x?.name || ""))) return true;
+    if (chain.some(x => x instanceof TypeError && /fetch|network|terminated/i.test(x.message))) return true;
+    const st = Number(e?.status) || Number(/^HTTP (\d{3})\b/.exec(String(e?.message || e))?.[1]) || 0;
+    if (st === 408 || st === 425 || st === 429 || st >= 500) return true;
+    return /fetch failed|SendRequest|error sending request|client error|unreachable|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|timeout|timed out|aborted|socket|network|connection|dns|tls|handshake|reset|closed/i
+      .test(chain.map(x => String(x?.message || x)).join(" | "));
   }
 
-  clearSavedSession() {
-    if (this.sessionFile && fs.existsSync(this.sessionFile)) {
-      // Keep a copy: deleting the only copy of a login has already cost users their session once.
-      try { fs.copyFileSync(this.sessionFile, `${this.sessionFile}.bak`); fs.chmodSync(`${this.sessionFile}.bak`, 0o600); } catch {}
-      fs.unlinkSync(this.sessionFile);
-    }
+  // Positive evidence that the session itself is dead: 401/403 or an explicit expiry/no-session signal.
+  isAuthInvalid(e) {
+    const msg = String(e?.message || e);
+    const st = Number(e?.status) || Number(/^HTTP (\d{3})\b/.exec(msg)?.[1]) || 0;
+    if (st === 401 || st === 403) return true;
+    return /no active clerk session|expired clerk session|session (has )?(expired|revoked|invalid)|could not mint a clerk session jwt|no clerk session id/i.test(msg);
+  }
+
+  hasLoginCredentials() {
+    return !!(this.email || credentialValue("VENICE_EMAIL")) && !!(this.password || credentialValue("VENICE_PASSWORD"));
+  }
+
+  // The session is dead. With credentials the next step is a fresh login, which atomically replaces
+  // the file (a backup is taken first). Without them the file is kept, requests back off, and the
+  // caller gets one actionable error instead of "Missing required credential" on every request.
+  handleInvalidSession(cause) {
+    this.backupSession();
+    if (this.hasLoginCredentials()) return;   // fall through to login(); it overwrites session.json
+    this.authStrikes = (this.authStrikes || 0) + 1;
+    this.authBlockedUntil = nowMs() + Math.min(30_000 * 2 ** (this.authStrikes - 1), 600_000);
+    const err = new Error("Venice session expired or invalid - run: venice-opencode login");
+    err.authInvalid = true; err.cause = cause;
+    throw err;
   }
 
   restoreSavedSession(snapshot) {
@@ -1174,11 +1258,16 @@ export class VeniceWebClient {
   }
 
   async ensureAuthenticated() {
+    if (this.authBlockedUntil && nowMs() < this.authBlockedUntil) {
+      const err = new Error("Venice session expired or invalid - run: venice-opencode login");
+      err.authInvalid = true; throw err;
+    }
     const saved = this.readSavedSession();
     if (saved && this.hasUsableSavedJwt(saved)) {
       this.restoreSavedSession(saved);
       try {
         const userSession = await this.getUserSession(saved.clerkJwt);
+        this.authStrikes = 0; this.authBlockedUntil = 0;
         this.writeSavedSession({ lastValidatedAt: nowMs() });
         return {
           source: "session",
@@ -1190,8 +1279,8 @@ export class VeniceWebClient {
           userSession,
         };
       } catch (e) {
-        if (this.isTransientError(e)) throw e;
-        this.clearSavedSession();
+        if (!this.isAuthInvalid(e)) throw e;   // unknown or transient: keep the login
+        this.handleInvalidSession(e);
       }
     }
 
@@ -1211,8 +1300,8 @@ export class VeniceWebClient {
           userSession,
         };
       } catch (e) {
-        if (this.isTransientError(e)) throw e;
-        this.clearSavedSession();
+        if (!this.isAuthInvalid(e)) throw e;   // unknown or transient: keep the login
+        this.handleInvalidSession(e);
       }
     }
 

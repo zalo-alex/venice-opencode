@@ -732,14 +732,14 @@ const handler = async (req, res) => {
     // server-side, leaving nothing to forward. Returning that as a plain reply would end
     // opencode's loop with the task unfinished, so a turn is retried until it yields a tool call
     // or a real answer. MAX_TRIES=0 (default) means no limit; only a dead session gives up.
-    const MAX_TRIES = Number(process.env.MAX_TRIES ?? (on("L4") ? 8 : 0));
+    const MAX_TRIES = Number(process.env.MAX_TRIES ?? 8);   // 0 = unlimited
     // A reply that only announces the next step ("I'll write the file.") is retried too, but
     // only a few times: if the model insists, it probably is its answer.
     const MAX_ANNOUNCE = 5;
     const announcesOnly = (t) => names.length && !t.calls.length && t.rest.trim().length < 300
       && (/^(i'?ll|i will|i'm going to|let me|now|next|first|continuing|checking|pulling|trying|testing|time to|reading|writing|running|creating|searching|looking)\b/i.test(t.rest.trim())
         || /:\s*$/.test(t.rest.trim()));
-    const fatal = (t) => /no valid Venice session|Missing required credential|HTTP 40[13]\b/.test(t.error || "");
+    const fatal = (t) => /no valid Venice session|Venice session expired|Missing required credential|HTTP 40[13]\b/i.test(t.error || "");
     // Mid-loop (last message is a tool result) a text-only reply usually means the model lost the
     // thread, not that it is done. Re-prompt a few times unless it signals completion.
     const lastMsg = [...(body.messages || [])].reverse().find(m => m?.role !== "system");
@@ -780,7 +780,7 @@ const handler = async (req, res) => {
         }
         if (names.length && attempt === 1) protoWin(nativeFor(1), false);
         authFails = fatal(t) ? authFails + 1 : 0;
-        if (authFails >= 4) break;
+        if (authFails >= 4 || /Venice session expired|no valid Venice session/i.test(t.error || "")) break;   // retrying cannot fix a dead login
         const label = MAX_TRIES ? `${attempt}/${MAX_TRIES}` : String(attempt);
         if (t.rest.trim()) {
           const announce = !t.swallowed && !t.badCall && announcesOnly(t);
@@ -798,7 +798,10 @@ const handler = async (req, res) => {
         }
         if (limitedUntil > Date.now()) break;
         // Back off gently (0.4s, 0.8s, ... capped at 15s) so a long Venice outage is not hammered.
-        await new Promise(r => setTimeout(r, on("L4") ? Math.min(300 * 2 ** (attempt - 1), 8000) * (0.6 + Math.random() * 0.8) : Math.min(400 * attempt, 15_000)));
+        // Errors back off exponentially with jitter (0.3s, 0.6s, 1.2s ... 15s); a model that merely
+        // failed to produce a call is retried almost at once.
+        const base = t?.error ? Math.min(300 * 2 ** (attempt - 1), 15_000) : 300;
+        await new Promise(r => setTimeout(r, base * (0.6 + Math.random() * 0.8)));
       }
       if (limitedUntil > Date.now()) {
         const rl = { text: "", thinking: "", calls: [], trace: [], raw: [], attempts: 1 };
@@ -807,7 +810,7 @@ const handler = async (req, res) => {
       if (clientGone && t) return t;
       t = t || { text: "", thinking: "", calls: [], trace: [], raw: [] };
       t.attempts = MAX_TRIES || 99;
-      t.rest = `[venice upstream error: ${t.error || "empty response"}${authFails >= 4 ? " - run: venice-opencode login" : ""}]`;
+      t.rest = `[venice upstream error: ${t.error || "empty response"}${/run: venice-opencode login/.test(t.error || "") ? "" : authFails >= 4 ? " - run: venice-opencode login" : ""}${authFails < 4 && MAX_TRIES && !/run: venice-opencode login/.test(t.error || "") ? ` (gave up after ${MAX_TRIES} attempts; set MAX_TRIES=0 to retry forever)` : ""}]`;
       return t;
     };
 

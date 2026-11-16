@@ -13,7 +13,8 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "setup": "node bin/venice-opencode.mjs setup"
+    "setup": "node bin/venice-opencode.mjs setup",
+    "test": "node --test test/*.test.mjs"
   },
   "repository": {
     "type": "git",
