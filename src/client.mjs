@@ -938,17 +938,28 @@ export class VeniceWebClient {
   // deepseek-v4-1-flash-free that the plain chat endpoint does not serve.
   async openAgentChatStream(jwt, messages, options = {}) {
     const agentModelId = options.agentModelId || "deepseek-v4-1-flash-free";
-    const requestBody = {
-      clientTools: Array.isArray(options.clientTools) ? options.clientTools : [],
-      input: { messages },
-    };
-    debugLog("outerface:req", {
-      method: "POST",
-      path: `/api/inference/chat/agents/venice?agentModelId=${agentModelId}`,
-      body: requestBody,
-    });
+    const clientTools = Array.isArray(options.clientTools) ? options.clientTools : [];
+    // The "venice" agent comes with Venice's own server-side tools (web scrape, web search, image
+    // generation, ...). They run on the user's quota and their results never reach the client, so
+    // the default is the "ad-hoc" agent, which only has the tools it is given (none).
+    // VENICE_AGENT=venice restores the old endpoint.
+    const adhoc = (options.agent || process.env.VENICE_AGENT || "ad-hoc") !== "venice";
+    const requestBody = adhoc
+      ? {
+          messages,
+          modelId: agentModelId,
+          systemPrompt: { instructions: options.system || "You are a coding assistant. You have no built-in tools: no web access, no image generation, no browsing. Use only the tools the user message describes." },
+          tools: [],
+          clientTools,
+        }
+      : { clientTools, input: { messages } };
+    if (options.extraBody && typeof options.extraBody === "object") Object.assign(requestBody, options.extraBody);
+    const reqPath = adhoc
+      ? "/api/inference/chat/agents/ad-hoc"
+      : `/api/inference/chat/agents/venice?agentModelId=${encodeURIComponent(agentModelId)}`;
+    debugLog("outerface:req", { method: "POST", path: reqPath, body: requestBody });
     const response = await this.request(
-      `${OUTFACE_BASE_URL}/api/inference/chat/agents/venice?agentModelId=${encodeURIComponent(agentModelId)}`,
+      `${OUTFACE_BASE_URL}${reqPath}`,
       {
         method: "POST",
         headers: {

@@ -140,3 +140,27 @@ test("no session and no credentials gives the single actionable error", async ()
   const c = new VeniceWebClient({ sessionFile: path.join(dir, "session.json") });
   await assert.rejects(c.ensureAuthenticated(), (e) => e.authInvalid && /run: venice-opencode login/.test(e.message) && !/Missing required credential/.test(e.message));
 });
+
+test("agent requests use the ad-hoc endpoint with no Venice server tools", async () => {
+  const { c } = setup();
+  let seen;
+  c.request = async (url, init) => { seen = { url, body: JSON.parse(init.body) }; return { ok: true, body: (async function* () {})() }; };
+  c.outerfaceHeaders = () => ({});
+  await c.openAgentChatStream("jwt", [{ type: "message", role: "user", content: [] }], { agentModelId: "m1", clientTools: [] }).catch(() => {});
+  assert.match(seen.url, /\/api\/inference\/chat\/agents\/ad-hoc$/);
+  assert.deepEqual(seen.body.tools, []);
+  assert.equal(seen.body.modelId, "m1");
+  assert.ok(seen.body.systemPrompt.instructions);
+});
+
+test("VENICE_AGENT=venice restores the legacy endpoint", async () => {
+  const { c } = setup();
+  let seen; process.env.VENICE_AGENT = "venice";
+  try {
+    c.request = async (url, init) => { seen = { url, body: JSON.parse(init.body) }; return { ok: true, body: (async function* () {})() }; };
+    c.outerfaceHeaders = () => ({});
+    await c.openAgentChatStream("jwt", [], { agentModelId: "m1" }).catch(() => {});
+    assert.match(seen.url, /agents\/venice\?agentModelId=m1$/);
+    assert.ok(seen.body.input);
+  } finally { delete process.env.VENICE_AGENT; }
+});
